@@ -1,0 +1,236 @@
+# This action generates a weekly report as a github issue
+# More details in https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/24672
+
+name: 'Generate Weekly Report'
+on:
+  workflow_dispatch: 
+  push:
+    branches: [ chore/weekly-report-gen ]
+
+jobs:
+  get_issues:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/github-script@v6
+        id: get-issues
+        with:
+          retries: 3
+          script: |
+            async function getIssues(github, queryParams, filterPrs = true) {
+              let allIssues = [];
+              try {
+                while (true) {
+                  const response = await github.issues.listForRepo(queryParams);
+                  // filter out pull requests
+                  const issues = filterPrs ? response.data.filter(issue => !issue.pull_request) : response.data;
+                  allIssues = allIssues.concat(issues);
+            
+                  // Check the 'link' header to see if there are more pages
+                  const linkHeader = response.headers.link;
+                  if (!linkHeader || !linkHeader.includes('rel="next"')) {
+                    break;
+                  }
+            
+                  queryParams.page++;
+                }
+                return allIssues;
+              } catch (error) {
+                console.error('Error fetching issues:', error);
+                return [];
+              }
+            }
+            
+            function genLookbackDates() {
+              const now = new Date();
+              const midnightYesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+              const sevenDaysAgo = new Date(midnightYesterday);
+              sevenDaysAgo.setDate(midnightYesterday.getDate() - 7);
+              return { sevenDaysAgo, midnightYesterday};
+            }
+            
+            function filterOnDateRange({ issue, sevenDaysAgo, midnightYesterday }) {
+              const createdAt = new Date(issue.created_at);
+              return createdAt >= sevenDaysAgo && createdAt <= midnightYesterday;
+            }
+            
+            async function getNewIssues(github) {
+              const { sevenDaysAgo, midnightYesterday } = genLookbackDates();
+              const queryParams = {
+                owner: 'open-telemetry',
+                repo: 'opentelemetry-collector-contrib',
+                state: 'all', // To get both open and closed issues
+                per_page: 100, // Number of items per page (maximum allowed)
+                page: 1, // Start with page 1
+                since: sevenDaysAgo.toISOString(),
+              };
+            
+              try {
+                const allIssues = await getIssues(github, queryParams)
+                const filteredIssues = allIssues.filter(issue => filterOnDateRange({ issue, sevenDaysAgo, midnightYesterday }));
+                return filteredIssues;
+              } catch (error) {
+                console.error('Error fetching issues:', error);
+                return [];
+              }
+            }
+            
+            async function getTargetLabelIssues(octokit, labels, filterPrs) {
+              const queryParams = {
+                owner: 'open-telemetry',
+                repo: 'opentelemetry-collector-contrib',
+                state: 'open',
+                per_page: 100, // Number of items per page (maximum allowed)
+                page: 1, // Start with page 1
+                labels
+              };
+              try {
+                const allIssues = await getIssues(octokit, queryParams, filterPrs)
+                return allIssues;
+              } catch (error) {
+                console.error('Error fetching issues:', error);
+                return [];
+              }
+            }
+            
+            async function getIssuesData(github) {
+              const targetLabels = {
+                "needs triage": {
+                  filterPrs: true,
+                  alias: "issuesTriage",
+                },
+                "ready to merge": {
+                  filterPrs: false,
+                  alias: "issuesReadyToMerge",
+                },
+                "Sponsor Needed": {
+                  filterPrs: true,
+                  alias: "issuesSponsorNeeded",
+                },
+              };
+            
+              const issuesNew = await getNewIssues(github.rest);
+              const issuesWithLabels = {};
+              for (const lbl of Object.keys(targetLabels)) {
+                const filterPrs = targetLabels[lbl].filterPrs;
+                const resp = await getTargetLabelIssues(github.rest, lbl, filterPrs);
+                issuesWithLabels[lbl] = resp;
+              }
+            
+              // tally results
+              const stats = {
+                issuesNew: {
+                  title: "New issues",
+                  count: 0,
+                  data: []
+                },
+                issuesTriage: {
+                  title: "Issues needing triage",
+                  count: 0,
+                  data: []
+                },
+                issuesReadyToMerge: {
+                  title: "Issues ready to merge",
+                  count: 0,
+                  data: []
+                },
+                issuesSponsorNeeded: {
+                  title: "Issues needing sponsorship",
+                  count: 0,
+                  data: []
+                },
+                issuesNewSponsorNeeded: {
+                  title: "New issues needing sponsorship",
+                  count: 0,
+                  data: []
+                },
+              }
+            
+              // add new issues
+              issuesNew.forEach(issue => {
+                stats.issuesNew.count++;
+                const { url, title, number } = issue;
+                stats.issuesNew.data.push({ url, title, number });
+              });
+            
+              // add issues with labels
+              for (const lbl of Object.keys(targetLabels)) {
+                const alias = targetLabels[lbl].alias;
+                stats[alias].count = issuesWithLabels[lbl].length;
+                stats[alias].data = issuesWithLabels[lbl].map(issue => {
+                  const { url, title, number } = issue;
+                  return { url, title, number };
+                })
+              }
+            
+              // add new issues with sponsor needed label
+              const { sevenDaysAgo, midnightYesterday } = genLookbackDates();
+              const sponsorNeededIssues = issuesWithLabels["Sponsor Needed"].filter(issue => filterOnDateRange({ issue, sevenDaysAgo, midnightYesterday }));
+              sponsorNeededIssues.forEach(issue => {
+                stats.issuesNewSponsorNeeded.count++;
+                const { url, title, number } = issue;
+                stats.issuesNewSponsorNeeded.data.push({ url, title, number });
+              });
+              return stats
+            }
+            
+            function generateReport({issuesData}) {
+              const out = ['<ul>'];
+            
+              for (const lbl of Object.keys(issuesData)) {
+                const section = [];
+                const {count, data, title} = issuesData[lbl];
+                section.push(`<li> ${title}: ${count}`);
+                section.push(`<details>
+                <summary> Issues </summary>
+                <ul>
+                ${data.map((issue) => {
+                  const {url, title, number} = issue;
+                  return `<li><a href="${url}">#${number}</a> ${title}</li>`;
+                }).join('\n')}
+                </ul>
+            </details>`);
+                section.push('</li>');
+                out.push(section.join('\n'));
+              }
+            
+              out.push('</ul>');
+            
+              // add json data
+              out.push('\n ## JSON Data');
+              out.push('<!-- MACHINE GENERATED: DO NOT EDIT -->');
+              out.push( `<details>
+            <summary>Expand</summary>
+            <pre>
+            {
+              "issuesData": ${JSON.stringify(issuesData, null, 2)}
+            }
+            </pre>
+            </details>`);
+              const report = out.join('\n');
+              return report;
+            }
+            
+            async function createIssue({github, lookbackData, report}) {
+              const title = `Weekly Report: ${lookbackData.sevenDaysAgo.toISOString().slice(0, 10)} - ${lookbackData.midnightYesterday.toISOString().slice(0, 10)}`;
+              return github.rest.issues.create({
+                // TODO: change
+                owner: "kevinslin",
+                repo: "opentelemetry-collector-contrib",
+                title,
+                body: report,
+                labels: ["report"]
+              })
+            }
+            
+            async function main({ github, context }) {
+              const lookbackData = genLookbackDates();
+              const issuesData = await getIssuesData(github)
+              const report = generateReport({issuesData})
+            
+              // const fs = require('fs');
+              // const report = fs.readFileSync('./fixtures/report.md', 'utf8')
+              await createIssue({github, lookbackData, report});
+            }
+            
+            await main({github, context})
